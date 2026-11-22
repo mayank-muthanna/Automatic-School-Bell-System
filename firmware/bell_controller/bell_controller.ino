@@ -10,6 +10,19 @@ static_assert(sizeof(WIFI_PASSWORD) >= 9 && sizeof(WIFI_PASSWORD) <= 64,
               "Choose an 8 to 63 character Wi-Fi password in bell_secrets.h");
 
 const int LED_PIN = 2;
+const int BUZZER_PIN = 23;  // 3-pin buzzer module I/O
+
+// The buzzer module on this prototype has an active-low input.
+const int BUZZER_ACTIVE_LEVEL = LOW;
+const int BUZZER_INACTIVE_LEVEL = HIGH;
+
+const char MORSE_MAYANK[] = "-- .- -.-- .- -. -.-";
+const uint32_t MORSE_DOT_MS = 100;
+const uint32_t MORSE_DASH_MS = 3 * MORSE_DOT_MS;
+const uint32_t MORSE_SYMBOL_GAP_MS = MORSE_DOT_MS;
+const uint32_t MORSE_LETTER_GAP_MS = 3 * MORSE_DOT_MS;
+const uint32_t MORSE_REPEAT_GAP_MS = 7 * MORSE_DOT_MS;
+
 const int MAX_EVENTS = 60;
 
 RTC_DS3231 rtc;
@@ -32,7 +45,11 @@ const char* DAY_NAMES[] = {
 };
 
 bool bellActive = false;
+bool morseToneOn = false;
+uint8_t morseIndex = 0;
+
 uint32_t bellEnd = 0;
+uint32_t nextMorseTransition = 0;
 uint32_t lastMinuteSeen = 0;
 
 String pad2(int n) {
@@ -97,16 +114,71 @@ void loadSettings() {
   }
 }
 
+void setMorseOutputs(bool on) {
+  morseToneOn = on;
+
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+  digitalWrite(
+    BUZZER_PIN,
+    on ? BUZZER_ACTIVE_LEVEL : BUZZER_INACTIVE_LEVEL
+  );
+}
+
+void stopBell() {
+  bellActive = false;
+  setMorseOutputs(false);
+}
+
 void startBell(uint32_t durationMs) {
+  uint32_t now = millis();
+
   bellActive = true;
-  digitalWrite(LED_PIN, HIGH);
-  bellEnd = millis() + durationMs;
+  bellEnd = now + durationMs;
+  morseIndex = 0;
+
+  setMorseOutputs(true);
+  nextMorseTransition = now + MORSE_DASH_MS;
+
+  Serial.printf(
+    "MAYANK MORSE STARTED: %lu ms\n",
+    (unsigned long)durationMs
+  );
 }
 
 void updateBell() {
-  if (bellActive && (int32_t)(millis() - bellEnd) >= 0) {
-    digitalWrite(LED_PIN, LOW);
-    bellActive = false;
+  if (!bellActive) return;
+
+  uint32_t now = millis();
+
+  if ((int32_t)(now - bellEnd) >= 0) {
+    stopBell();
+    Serial.println("Bell finished.");
+    return;
+  }
+
+  if ((int32_t)(now - nextMorseTransition) < 0) return;
+
+  if (morseToneOn) {
+
+    setMorseOutputs(false);
+    morseIndex++;
+
+    if (MORSE_MAYANK[morseIndex] == '\0') {
+
+      morseIndex = 0;
+      nextMorseTransition = now + MORSE_REPEAT_GAP_MS;
+    } else if (MORSE_MAYANK[morseIndex] == ' ') {
+      morseIndex++;
+      nextMorseTransition = now + MORSE_LETTER_GAP_MS;
+    } else {
+      nextMorseTransition = now + MORSE_SYMBOL_GAP_MS;
+    }
+  } else {
+
+    const char symbol = MORSE_MAYANK[morseIndex];
+    setMorseOutputs(true);
+    nextMorseTransition = now +
+      (symbol == '.' ? MORSE_DOT_MS : MORSE_DASH_MS);
   }
 }
 
@@ -431,7 +503,9 @@ button.secondary { background: #475569; }
 <div class="card">
   <h2>Test Bell</h2>
   <p class="small">
-    Light the onboard LED for the selected duration.
+    Play MAYANK in Morse code: -- .- -.-- .- -. -.-
+    The buzzer and LED pulse together. The message repeats until
+    the selected duration ends (a full message takes about 5.9 seconds).
   </p>
 
   <form action="/test" method="POST">
@@ -467,6 +541,10 @@ button.secondary { background: #475569; }
 
   page += R"HTML(
   <h3>Add Bell Event</h3>
+  <p class="small">
+    A complete MAYANK takes about 5.9 seconds. Shorter bell
+    durations will stop the message partway through.
+  </p>
 
   <form action="/add" method="POST">
     <div class="row">
@@ -532,7 +610,7 @@ button.secondary { background: #475569; }
 </div>
 
 <p class="small" style="text-align:center">
-  KALS Automated Bell System - LED Prototype
+  KALS Automated Bell System - MAYANK Morse Prototype
 </p>
 
 </div>
@@ -603,6 +681,10 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+
+  digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, BUZZER_INACTIVE_LEVEL);
 
   Wire.begin(21, 22);
 
