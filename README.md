@@ -1,8 +1,18 @@
 # Automatic School Bell System
 
+[![Compile ESP32 sketches](https://github.com/mayank-muthanna/Automatic-School-Bell-System/actions/workflows/compile.yml/badge.svg?branch=main)](https://github.com/mayank-muthanna/Automatic-School-Bell-System/actions/workflows/compile.yml)
+
 A school bell controller that runs from an ESP32 and a DS3231 clock. A laptop connects directly to the controller to set the time, test the bell, and edit the weekly timetable. Once configured, the controller runs the schedule with the laptop disconnected.
 
 The bench prototype uses the onboard blue LED and an active-low buzzer. Both spell **MAYANK** in Morse code for the selected ring duration. Driving the school's existing momentary switch with a solenoid is a future hardware milestone.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| [firmware/bell_controller](firmware/bell_controller) | Clock dashboard, weekly scheduler, and bell output |
+| [examples/esp32_led](examples/esp32_led) | ESP32 upload and onboard LED check |
+| [examples/rtc_clock](examples/rtc_clock) | Standalone DS3231 clock check |
 
 ## Hardware and connections
 
@@ -46,4 +56,4 @@ The timetable stores up to **60 weekly events** in ESP32 flash. Each event has a
 
 The milestones reconstruct the bench build in order. The first two sketches remain available as independent hardware checks. The controller then adds the local clock dashboard, the persistent timetable with LED output, and the Morse buzzer.
 
-Use one focused commit per feature branch and open its pull request against `develop`. Squash-merge the feature PR, then promote a reviewed snapshot from `develop` into `main`. Include the board used and the observed result for hardware changes. The compile workflow builds the two examples and the controller for the ESP32 Dev Module.
+See [Contributing](CONTRIBUTING.md) for the pull request workflow and bench checks. See the [changelog](CHANGELOG.md) for release history.
