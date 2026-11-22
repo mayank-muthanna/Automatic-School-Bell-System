@@ -1,2 +1,3 @@
-# Automatic-School-Bell-System
-Offline ESP32 school bell controller with a DS3231 clock, a local scheduling dashboard, and synchronized buzzer and LED output.
+# Automatic School Bell System
+
+An offline, weekly school bell controller for the ESP32.
