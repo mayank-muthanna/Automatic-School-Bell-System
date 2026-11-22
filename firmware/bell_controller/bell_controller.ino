@@ -2,18 +2,140 @@
 #include <WebServer.h>
 #include <Wire.h>
 #include <RTClib.h>
+#include <Preferences.h>
 #include "bell_secrets.h"
 
 const char* WIFI_NAME = "KALS-BELL";
 static_assert(sizeof(WIFI_PASSWORD) >= 9 && sizeof(WIFI_PASSWORD) <= 64,
               "Choose an 8 to 63 character Wi-Fi password in bell_secrets.h");
 
+const int LED_PIN = 2;
+const int MAX_EVENTS = 60;
+
 RTC_DS3231 rtc;
 WebServer server(80);
+
+struct BellEvent {
+  uint8_t day;
+  uint8_t hour;
+  uint8_t minute;
+  uint16_t durationMs;
+};
+
+BellEvent events[MAX_EVENTS] = {};
+int eventCount = 0;
+bool scheduleEnabled = false;
+
+const char* DAY_NAMES[] = {
+  "Sunday", "Monday", "Tuesday",
+  "Wednesday", "Thursday", "Friday", "Saturday"
+};
+
+bool bellActive = false;
+uint32_t bellEnd = 0;
+uint32_t lastMinuteSeen = 0;
+
+String pad2(int n) {
+  return n < 10 ? "0" + String(n) : String(n);
+}
+
+uint32_t durationFromRequest() {
+  if (!server.hasArg("duration")) return 0;
+
+  float seconds = server.arg("duration").toFloat();
+
+  if (seconds < 0.1f || seconds > 30.0f) {
+    return 0;
+  }
+
+  return (uint32_t)(seconds * 1000 + 0.5f);
+}
 
 void redirectHome() {
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", "");
+}
+
+void saveSettings() {
+  Preferences p;
+  if (!p.begin("kalsbell", false)) return;
+
+  p.putUChar("count", eventCount);
+  p.putBytes("events", events, sizeof(events));
+  p.putBool("enabled", scheduleEnabled);
+
+  p.end();
+}
+
+void loadSettings() {
+  Preferences p;
+  if (!p.begin("kalsbell", true)) return;
+
+  int savedCount = p.getUChar("count", 0);
+
+  if (savedCount >= 0 &&
+      savedCount <= MAX_EVENTS &&
+      p.getBytesLength("events") == sizeof(events)) {
+
+    p.getBytes("events", events, sizeof(events));
+    eventCount = savedCount;
+  }
+
+  scheduleEnabled = p.getBool("enabled", false);
+  p.end();
+
+  for (int i = 0; i < eventCount; i++) {
+    if (events[i].day > 6 ||
+        events[i].hour > 23 ||
+        events[i].minute > 59 ||
+        events[i].durationMs < 100 ||
+        events[i].durationMs > 30000) {
+      eventCount = 0;
+      scheduleEnabled = false;
+      break;
+    }
+  }
+}
+
+void startBell(uint32_t durationMs) {
+  bellActive = true;
+  digitalWrite(LED_PIN, HIGH);
+  bellEnd = millis() + durationMs;
+}
+
+void updateBell() {
+  if (bellActive && (int32_t)(millis() - bellEnd) >= 0) {
+    digitalWrite(LED_PIN, LOW);
+    bellActive = false;
+  }
+}
+
+void checkSchedule() {
+  static uint32_t lastCheck = 0;
+
+  if (millis() - lastCheck < 150) return;
+  lastCheck = millis();
+
+  DateTime now = rtc.now();
+  uint32_t currentMinute = now.unixtime() / 60;
+
+  if (currentMinute == lastMinuteSeen) return;
+
+  lastMinuteSeen = currentMinute;
+
+  if (!scheduleEnabled) return;
+
+  for (int i = 0; i < eventCount; i++) {
+    BellEvent &e = events[i];
+
+    if (e.day == now.dayOfTheWeek() &&
+        e.hour == now.hour() &&
+        e.minute == now.minute()) {
+
+      startBell(e.durationMs);
+      break;
+    }
+  }
 }
 
 void handleTime() {
@@ -67,8 +189,113 @@ void handleSetTime() {
 
   rtc.adjust(newTime);
 
+  // Skip the current minute after a reset or manual clock adjustment.
+  lastMinuteSeen = rtc.now().unixtime() / 60;
 
   Serial.println("RTC time updated.");
+  redirectHome();
+}
+
+void handleAdd() {
+  if (eventCount >= MAX_EVENTS) {
+    server.send(400, "text/plain", "Schedule is full");
+    return;
+  }
+
+  if (!server.hasArg("day") ||
+      !server.hasArg("at")) {
+    server.send(400, "text/plain", "Missing event fields");
+    return;
+  }
+
+  int day = server.arg("day").toInt();
+
+  int hour = -1;
+  int minute = -1;
+
+  String timeValue = server.arg("at");
+
+  if (sscanf(
+        timeValue.c_str(),
+        "%d:%d",
+        &hour, &minute
+      ) != 2) {
+    server.send(400, "text/plain", "Invalid time");
+    return;
+  }
+
+  uint32_t duration = durationFromRequest();
+
+  if (day < 0 || day > 6 ||
+      hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      duration == 0) {
+    server.send(400, "text/plain", "Invalid event");
+    return;
+  }
+
+  for (int i = 0; i < eventCount; i++) {
+    if (events[i].day == day &&
+        events[i].hour == hour &&
+        events[i].minute == minute) {
+      server.send(
+        400,
+        "text/plain",
+        "An event already exists at this time"
+      );
+      return;
+    }
+  }
+
+  events[eventCount] = {
+    (uint8_t)day,
+    (uint8_t)hour,
+    (uint8_t)minute,
+    (uint16_t)duration
+  };
+
+  eventCount++;
+  saveSettings();
+  redirectHome();
+}
+
+void handleDelete() {
+  if (!server.hasArg("id")) {
+    server.send(400, "text/plain", "Missing ID");
+    return;
+  }
+
+  int id = server.arg("id").toInt();
+
+  if (id < 0 || id >= eventCount) {
+    server.send(400, "text/plain", "Invalid ID");
+    return;
+  }
+
+  for (int i = id; i < eventCount - 1; i++) {
+    events[i] = events[i + 1];
+  }
+
+  eventCount--;
+  saveSettings();
+  redirectHome();
+}
+
+void handleToggle() {
+  scheduleEnabled = !scheduleEnabled;
+  saveSettings();
+  redirectHome();
+}
+
+void handleTest() {
+  uint32_t duration = durationFromRequest();
+
+  if (duration == 0) {
+    server.send(400, "text/plain", "Invalid duration");
+    return;
+  }
+
+  startBell(duration);
   redirectHome();
 }
 
@@ -201,7 +428,115 @@ button.secondary { background: #475569; }
   </form>
 </div>
 
+<div class="card">
+  <h2>Test Bell</h2>
+  <p class="small">
+    Light the onboard LED for the selected duration.
+  </p>
+
+  <form action="/test" method="POST">
+    <div class="row">
+      <label>
+        Duration (seconds)
+        <input type="number"
+               name="duration"
+               value="6"
+               min="0.1"
+               max="30"
+               step="0.1"
+               required>
+      </label>
+      <button type="submit">Test Bell</button>
+    </div>
+  </form>
 </div>
+
+<div class="card">
+  <h2>Weekly Schedule</h2>
+
+  <form action="/toggle" method="POST">
+)HTML";
+
+  page += "<p>Automatic scheduling: <b>";
+  page += scheduleEnabled ? "ENABLED" : "PAUSED";
+  page += "</b></p>";
+
+  page += "<button type='submit' class='secondary'>";
+  page += scheduleEnabled ? "Pause Schedule" : "Enable Schedule";
+  page += "</button></form>";
+
+  page += R"HTML(
+  <h3>Add Bell Event</h3>
+
+  <form action="/add" method="POST">
+    <div class="row">
+
+      <select name="day" required>
+        <option value="1">Monday</option>
+        <option value="2">Tuesday</option>
+        <option value="3">Wednesday</option>
+        <option value="4">Thursday</option>
+        <option value="5">Friday</option>
+        <option value="6">Saturday</option>
+        <option value="0">Sunday</option>
+      </select>
+
+      <input type="time"
+             name="at"
+             required>
+
+      <label>
+        Duration (seconds)
+        <input type="number"
+               name="duration"
+               min="0.1"
+               max="30"
+               step="0.1"
+               value="6"
+               required>
+      </label>
+
+      <button type="submit">Add Event</button>
+    </div>
+  </form>
+
+  <h3>Saved Events</h3>
+)HTML";
+
+  if (eventCount == 0) {
+    page += "<p class='small'>No events yet.</p>";
+  }
+
+  for (int i = 0; i < eventCount; i++) {
+    BellEvent &e = events[i];
+
+    page += "<div class='event'><span><b>";
+    page += DAY_NAMES[e.day];
+    page += "</b> &nbsp;";
+    page += pad2(e.hour);
+    page += ":";
+    page += pad2(e.minute);
+    page += " &nbsp;(";
+    page += String(e.durationMs / 1000.0f, 1);
+    page += " seconds)</span>";
+
+    page += "<form method='POST' action='/delete'>";
+    page += "<input type='hidden' name='id' value='";
+    page += String(i);
+    page += "'>";
+    page += "<button class='danger' type='submit'>";
+    page += "Delete</button></form></div>";
+  }
+
+  page += R"HTML(
+</div>
+
+<p class="small" style="text-align:center">
+  KALS Automated Bell System - LED Prototype
+</p>
+
+</div>
+
 <script>
 async function refreshClock() {
   try {
@@ -264,6 +599,11 @@ setInterval(refreshClock, 1000);
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   Wire.begin(21, 22);
 
   if (!rtc.begin()) {
@@ -274,6 +614,11 @@ void setup() {
   if (rtc.lostPower()) {
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
+
+  loadSettings();
+
+  // Skip the current minute after a reset or manual clock adjustment.
+  lastMinuteSeen = rtc.now().unixtime() / 60;
 
   WiFi.mode(WIFI_AP);
 
@@ -286,6 +631,11 @@ void setup() {
   server.on("/time", HTTP_GET, handleTime);
 
   server.on("/settime", HTTP_POST, handleSetTime);
+  server.on("/add", HTTP_POST, handleAdd);
+  server.on("/delete", HTTP_POST, handleDelete);
+  server.on("/toggle", HTTP_POST, handleToggle);
+  server.on("/test", HTTP_POST, handleTest);
+
   server.begin();
 
   Serial.println("KALS Bell Controller Ready!");
@@ -295,5 +645,9 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  updateBell();
+  checkSchedule();
+
   delay(2);
 }
