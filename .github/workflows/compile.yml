@@ -1,0 +1,31 @@
+name: Compile ESP32 sketches
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    env:
+      BOARD_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install the board package and libraries
+        run: |
+          arduino-cli core update-index --additional-urls "$BOARD_INDEX"
+          arduino-cli core install esp32:esp32@3.0.7 --additional-urls "$BOARD_INDEX"
+          arduino-cli lib install "RTClib@2.1.4"
+      - name: Build examples and controller
+        run: |
+          echo 'constexpr char WIFI_PASSWORD[] = "compile-test-only";' > firmware/bell_controller/bell_secrets.h
+          for sketch in examples/esp32_led examples/rtc_clock firmware/bell_controller; do
+            arduino-cli compile --fqbn esp32:esp32:esp32 "$sketch"
+          done

@@ -1,0 +1,6 @@
+bell_secrets.h
+build/
+.pio/
+*.elf
+*.bin
+.DS_Store
