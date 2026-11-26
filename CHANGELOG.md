@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added a GPIO 18 output for a MOSFET-driven solenoid. Scheduled rings and Test Bell can each request one pulse of up to 150 ms, with a three-second cooldown between pulse starts.
+
 ## [0.1.0] — 2026-11-22
 
 First bench prototype for the ESP32 DevKit V1 and DS3231 RTC.
