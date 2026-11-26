@@ -4,7 +4,7 @@
 
 A school bell controller that runs from an ESP32 and a DS3231 clock. A laptop connects directly to the controller to set the time, test the bell, and edit the weekly timetable. Once configured, the controller runs the schedule with the laptop disconnected.
 
-The bench prototype uses the onboard blue LED and an active-low buzzer. Both spell **MAYANK** in Morse code for the selected ring duration. Driving the school's existing momentary switch with a solenoid is a future hardware milestone.
+The bench prototype uses the onboard blue LED and an active-low buzzer. Both spell **MAYANK** in Morse code for the selected ring duration. The firmware also pulses a MOSFET-driven solenoid for bench testing. Mounting and validating it against the school's existing momentary switch is a future hardware milestone.
 
 ## Repository layout
 
@@ -23,6 +23,7 @@ The bench prototype uses the onboard blue LED and an active-low buzzer. Both spe
 | DS3231 RTC module | SDA → GPIO 21, SCL → GPIO 22, VCC → 3V3, GND → GND | Keep local time while the ESP32 runs |
 | RTC backup cell | Battery holder on the RTC module | Keep time while USB power is disconnected |
 | Active-low buzzer module | I/O → GPIO 23, GND → common GND | Sound the same dots and dashes as the LED |
+| MOSFET driver module | Active-high control input → GPIO 18, signal GND → common GND | Switch the separately powered solenoid |
 
 Use a buzzer module compatible with a 3.3 V logic signal and power its supply pin according to its rating. GPIO 23 is the control signal. The RTC backup cell powers the clock only. Check the cell type against the particular RTC board's charging circuit.
 
@@ -40,6 +41,8 @@ Use a buzzer module compatible with a 3.3 V logic signal and power its supply pi
 2. Select **Test Bell** for six seconds. The blue LED and buzzer should pulse together. A shorter duration can end partway through a letter.
 3. Add an event for today's weekday at least two minutes ahead, then select **Enable Schedule**. The clock processes each minute once and skips the minute in which it starts up or the clock is set.
 4. Disconnect the laptop and leave the controller powered. At the chosen minute, check the LED and buzzer. Reconnect and restart the ESP32 to check that the event and schedule setting persist.
+
+With the solenoid driver connected, Test Bell and scheduled rings request a single pulse of up to **150 ms**. Pulse starts are at least **3 seconds** apart. The LED and buzzer still follow the selected ring duration even when the solenoid is cooling down.
 
 The timetable stores up to **60 weekly events** in ESP32 flash. Each event has a weekday, a local time to the minute, and a duration from **0.1 to 30 seconds**. A weekday and time can appear only once. A fresh configuration starts with scheduling paused.
 

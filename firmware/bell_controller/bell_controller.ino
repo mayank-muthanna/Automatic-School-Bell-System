@@ -3,6 +3,8 @@
 #include <Wire.h>
 #include <RTClib.h>
 #include <Preferences.h>
+#include <atomic>
+#include <esp_timer.h>
 #include "bell_secrets.h"
 
 const char* WIFI_NAME = "KALS-BELL";
@@ -11,6 +13,9 @@ static_assert(sizeof(WIFI_PASSWORD) >= 9 && sizeof(WIFI_PASSWORD) <= 64,
 
 const int LED_PIN = 2;
 const int BUZZER_PIN = 23;  // 3-pin buzzer module I/O
+const int SOLENOID_PIN = 18;  // Active-high MOSFET input
+const uint32_t SOLENOID_PULSE_MS = 150;
+const uint32_t SOLENOID_COOLDOWN_MS = 3000;
 
 // The buzzer module on this prototype has an active-low input.
 const int BUZZER_ACTIVE_LEVEL = LOW;
@@ -43,6 +48,11 @@ const char* DAY_NAMES[] = {
   "Sunday", "Monday", "Tuesday",
   "Wednesday", "Thursday", "Friday", "Saturday"
 };
+
+esp_timer_handle_t solenoidTimer = nullptr;
+std::atomic<bool> solenoidActive{false};
+bool solenoidHasPulsed = false;
+uint32_t lastSolenoidPulseAt = 0;
 
 bool bellActive = false;
 bool morseToneOn = false;
@@ -114,6 +124,36 @@ void loadSettings() {
   }
 }
 
+void stopSolenoid(void*) {
+  digitalWrite(SOLENOID_PIN, LOW);
+  solenoidActive.store(false);
+}
+
+void startSolenoidPulse(uint32_t durationMs) {
+  if (solenoidTimer == nullptr || durationMs == 0) return;
+
+  const uint32_t now = millis();
+  if (solenoidActive.load() ||
+      (solenoidHasPulsed && now - lastSolenoidPulseAt < SOLENOID_COOLDOWN_MS)) {
+    Serial.println("Solenoid skipped: cooling down.");
+    return;
+  }
+
+  const uint32_t pulseMs = min(durationMs, SOLENOID_PULSE_MS);
+  solenoidActive.store(true);
+  digitalWrite(SOLENOID_PIN, HIGH);
+
+  // Shut off from the ESP timer task even if the web server is busy.
+  if (esp_timer_start_once(solenoidTimer, pulseMs * 1000ULL) != ESP_OK) {
+    stopSolenoid(nullptr);
+    Serial.println("Solenoid pulse timer failed to start.");
+    return;
+  }
+
+  solenoidHasPulsed = true;
+  lastSolenoidPulseAt = now;
+}
+
 void setMorseOutputs(bool on) {
   morseToneOn = on;
 
@@ -138,6 +178,7 @@ void startBell(uint32_t durationMs) {
 
   setMorseOutputs(true);
   nextMorseTransition = now + MORSE_DASH_MS;
+  startSolenoidPulse(durationMs);
 
   Serial.printf(
     "MAYANK MORSE STARTED: %lu ms\n",
@@ -506,6 +547,7 @@ button.secondary { background: #475569; }
     Play MAYANK in Morse code: -- .- -.-- .- -. -.-
     The buzzer and LED pulse together. The message repeats until
     the selected duration ends (a full message takes about 5.9 seconds).
+    Test Bell also pulses the solenoid when its cooldown has elapsed.
   </p>
 
   <form action="/test" method="POST">
@@ -544,6 +586,7 @@ button.secondary { background: #475569; }
   <p class="small">
     A complete MAYANK takes about 5.9 seconds. Shorter bell
     durations will stop the message partway through.
+    Scheduled rings also pulse the solenoid when its cooldown has elapsed.
   </p>
 
   <form action="/add" method="POST">
@@ -676,7 +719,20 @@ setInterval(refreshClock, 1000);
 }
 
 void setup() {
+  digitalWrite(SOLENOID_PIN, LOW);
+  pinMode(SOLENOID_PIN, OUTPUT);
+
   Serial.begin(115200);
+
+  esp_timer_create_args_t timerArgs{};
+  timerArgs.callback = stopSolenoid;
+  timerArgs.dispatch_method = ESP_TIMER_TASK;
+  timerArgs.name = "solenoid-off";
+  if (esp_timer_create(&timerArgs, &solenoidTimer) != ESP_OK) {
+    solenoidTimer = nullptr;
+    Serial.println("Solenoid disabled: could not create pulse timer.");
+  }
+
   delay(500);
 
   pinMode(LED_PIN, OUTPUT);
