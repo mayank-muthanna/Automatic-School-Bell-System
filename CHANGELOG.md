@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Clarified GPIO 18 as a continuous hold and raised the configurable software ceiling to 12 seconds. The default hardware limit remains 150 ms.
+
 - Added independent buzzer and solenoid durations for Test Bell and weekly events. Existing timetables carry forward automatically.
 - Rebuilt the local dashboard with an editable events table and four sortable columns.
 
