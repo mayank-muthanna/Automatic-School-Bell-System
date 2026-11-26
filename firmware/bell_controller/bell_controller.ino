@@ -20,8 +20,9 @@ const int SOLENOID_PIN = 18;  // Active-high MOSFET input
 #endif
 constexpr uint16_t SOLENOID_MAX_MS = BELL_SOLENOID_MAX_MS;
 constexpr uint16_t BUZZER_MAX_MS = 30000;
-static_assert(BELL_SOLENOID_MAX_MS >= 1 && BELL_SOLENOID_MAX_MS <= 5000,
-              "Solenoid limit must be between 1 and 5000 ms");
+constexpr uint16_t SOLENOID_HOLD_CEILING_MS = 12000;
+static_assert(BELL_SOLENOID_MAX_MS >= 1 && BELL_SOLENOID_MAX_MS <= SOLENOID_HOLD_CEILING_MS,
+              "Solenoid limit must be between 1 and 12000 ms");
 const uint32_t SOLENOID_COOLDOWN_MS = 3000;
 
 // The buzzer module on this prototype has an active-low input.
@@ -65,7 +66,7 @@ const char* DAY_NAMES[] = {
 
 esp_timer_handle_t solenoidTimer = nullptr;
 std::atomic<bool> solenoidActive{false};
-bool solenoidHasPulsed = false;
+bool solenoidHasRun = false;
 std::atomic<uint32_t> lastSolenoidOffAt{0};
 
 bool bellActive = false;
@@ -134,7 +135,7 @@ void loadSettings() {
   for (int i = 0; i < schedule.count; i++) {
     const BellEvent& event = schedule.events[i];
     if (event.day > 6 || event.hour > 23 || event.minute > 59 ||
-        event.buzzerMs > BUZZER_MAX_MS || event.solenoidMs > 5000 ||
+        event.buzzerMs > BUZZER_MAX_MS || event.solenoidMs > SOLENOID_HOLD_CEILING_MS ||
         (event.buzzerMs == 0 && event.solenoidMs == 0)) {
       schedule = {};
       return;
@@ -148,27 +149,27 @@ void stopSolenoid(void*) {
   solenoidActive.store(false);
 }
 
-void startSolenoidPulse(uint32_t durationMs) {
+void startSolenoidHold(uint32_t durationMs) {
   if (solenoidTimer == nullptr || durationMs == 0) return;
 
   if (solenoidActive.load() ||
-      (solenoidHasPulsed && millis() - lastSolenoidOffAt.load() < SOLENOID_COOLDOWN_MS)) {
+      (solenoidHasRun && millis() - lastSolenoidOffAt.load() < SOLENOID_COOLDOWN_MS)) {
     Serial.println("Solenoid skipped: cooling down.");
     return;
   }
 
-  const uint32_t pulseMs = min(durationMs, static_cast<uint32_t>(SOLENOID_MAX_MS));
+  const uint32_t holdMs = min(durationMs, static_cast<uint32_t>(SOLENOID_MAX_MS));
   solenoidActive.store(true);
   digitalWrite(SOLENOID_PIN, HIGH);
 
   // Shut off from the ESP timer task even if the web server is busy.
-  if (esp_timer_start_once(solenoidTimer, pulseMs * 1000ULL) != ESP_OK) {
+  if (esp_timer_start_once(solenoidTimer, holdMs * 1000ULL) != ESP_OK) {
     stopSolenoid(nullptr);
-    Serial.println("Solenoid pulse timer failed to start.");
+    Serial.println("Solenoid hold timer failed to start.");
     return;
   }
 
-  solenoidHasPulsed = true;
+  solenoidHasRun = true;
 }
 
 void setMorseOutputs(bool on) {
@@ -187,7 +188,7 @@ void stopBell() {
 }
 
 void startBell(uint16_t buzzerMs, uint16_t solenoidMs) {
-  startSolenoidPulse(solenoidMs);
+  startSolenoidHold(solenoidMs);
   if (buzzerMs == 0) return;
 
   const uint32_t now = millis();
@@ -498,7 +499,7 @@ th,td{padding:9px 12px;border-bottom:1px solid var(--line)}th{font-size:.8rem;fo
 <h2>Test Bell</h2>
 <form id="testForm" class="grid">
 <label>Buzzer (s)<input name="buzzer" type="number" min="0" max="30" step=".001" value="6" required></label>
-<label>Solenoid (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
+<label>Solenoid hold (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
 <button class="primary" disabled>Ring</button>
 </form>
 </section>
@@ -508,7 +509,7 @@ th,td{padding:9px 12px;border-bottom:1px solid var(--line)}th{font-size:.8rem;fo
 <label>Day<select name="day"></select></label>
 <label>Time<input name="at" type="time" required></label>
 <label>Buzzer (s)<input name="buzzer" type="number" min="0" max="30" step=".001" value="6" required></label>
-<label>Solenoid (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
+<label>Solenoid hold (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
 <button class="primary" id="eventSubmit" disabled>Add event</button>
 <button id="cancel" type="button" hidden>Cancel</button>
 </form>
@@ -520,12 +521,12 @@ th,td{padding:9px 12px;border-bottom:1px solid var(--line)}th{font-size:.8rem;fo
 <option value="week">Day then time</option>
 <option value="time">Time of day</option>
 <option value="buzzer">Buzzer duration</option>
-<option value="solenoid">Solenoid duration</option>
+<option value="solenoid">Solenoid hold</option>
 </select></label>
 <button id="direction" type="button" aria-label="Sort descending">Ascending</button>
 </div></div>
 <div class="table"><table>
-<thead><tr><th scope="col">Day</th><th scope="col">Time</th><th scope="col">Buzzer (s)</th><th scope="col">Solenoid (s)</th><th scope="col">Actions</th></tr></thead>
+<thead><tr><th scope="col">Day</th><th scope="col">Time</th><th scope="col">Buzzer (s)</th><th scope="col">Solenoid hold (s)</th><th scope="col">Actions</th></tr></thead>
 <tbody id="rows"><tr><td colspan="5">Loading events</td></tr></tbody>
 </table></div>
 </section>
@@ -719,7 +720,7 @@ void setup() {
   timerArgs.name = "solenoid-off";
   if (esp_timer_create(&timerArgs, &solenoidTimer) != ESP_OK) {
     solenoidTimer = nullptr;
-    Serial.println("Solenoid disabled: could not create pulse timer.");
+    Serial.println("Solenoid disabled: could not create hold timer.");
   }
 
   delay(500);
