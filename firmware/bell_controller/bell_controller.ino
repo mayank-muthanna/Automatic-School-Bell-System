@@ -4,6 +4,7 @@
 #include <RTClib.h>
 #include <Preferences.h>
 #include <atomic>
+#include <cmath>
 #include <esp_timer.h>
 #include "bell_secrets.h"
 
@@ -14,7 +15,13 @@ static_assert(sizeof(WIFI_PASSWORD) >= 9 && sizeof(WIFI_PASSWORD) <= 64,
 const int LED_PIN = 2;
 const int BUZZER_PIN = 23;  // 3-pin buzzer module I/O
 const int SOLENOID_PIN = 18;  // Active-high MOSFET input
-const uint32_t SOLENOID_PULSE_MS = 150;
+#ifndef BELL_SOLENOID_MAX_MS
+#define BELL_SOLENOID_MAX_MS 150
+#endif
+constexpr uint16_t SOLENOID_MAX_MS = BELL_SOLENOID_MAX_MS;
+constexpr uint16_t BUZZER_MAX_MS = 30000;
+static_assert(BELL_SOLENOID_MAX_MS >= 1 && BELL_SOLENOID_MAX_MS <= 5000,
+              "Solenoid limit must be between 1 and 5000 ms");
 const uint32_t SOLENOID_COOLDOWN_MS = 3000;
 
 // The buzzer module on this prototype has an active-low input.
@@ -33,16 +40,23 @@ const int MAX_EVENTS = 60;
 RTC_DS3231 rtc;
 WebServer server(80);
 
-struct BellEvent {
-  uint8_t day;
-  uint8_t hour;
-  uint8_t minute;
+struct LegacyEvent {
+  uint8_t day, hour, minute;
   uint16_t durationMs;
 };
 
-BellEvent events[MAX_EVENTS] = {};
-int eventCount = 0;
-bool scheduleEnabled = false;
+struct BellEvent {
+  uint8_t day, hour, minute;
+  uint16_t buzzerMs, solenoidMs;
+};
+
+struct Schedule {
+  uint8_t count;
+  bool enabled;
+  BellEvent events[MAX_EVENTS];
+};
+
+Schedule schedule{};
 
 const char* DAY_NAMES[] = {
   "Sunday", "Monday", "Tuesday",
@@ -52,7 +66,7 @@ const char* DAY_NAMES[] = {
 esp_timer_handle_t solenoidTimer = nullptr;
 std::atomic<bool> solenoidActive{false};
 bool solenoidHasPulsed = false;
-uint32_t lastSolenoidPulseAt = 0;
+std::atomic<uint32_t> lastSolenoidOffAt{0};
 
 bool bellActive = false;
 bool morseToneOn = false;
@@ -62,84 +76,88 @@ uint32_t bellEnd = 0;
 uint32_t nextMorseTransition = 0;
 uint32_t lastMinuteSeen = 0;
 
-String pad2(int n) {
-  return n < 10 ? "0" + String(n) : String(n);
+int readDuration(const char* field, uint16_t maximumMs) {
+  const String value = server.arg(field);
+  char* end = nullptr;
+  const double seconds = strtod(value.c_str(), &end);
+  if (value.isEmpty() || *end || !std::isfinite(seconds) ||
+      seconds < 0 || seconds > maximumMs / 1000.0) return -1;
+
+  const long milliseconds = lround(seconds * 1000);
+  if (fabs(seconds * 1000 - milliseconds) > 0.00001) return -1;
+  return milliseconds;
 }
 
-uint32_t durationFromRequest() {
-  if (!server.hasArg("duration")) return 0;
-
-  float seconds = server.arg("duration").toFloat();
-
-  if (seconds < 0.1f || seconds > 30.0f) {
-    return 0;
-  }
-
-  return (uint32_t)(seconds * 1000 + 0.5f);
-}
-
-void redirectHome() {
-  server.sendHeader("Location", "/");
-  server.send(303, "text/plain", "");
-}
-
-void saveSettings() {
+bool saveSettings() {
   Preferences p;
-  if (!p.begin("kalsbell", false)) return;
-
-  p.putUChar("count", eventCount);
-  p.putBytes("events", events, sizeof(events));
-  p.putBool("enabled", scheduleEnabled);
-
+  if (!p.begin("kalsbell", false)) return false;
+  const bool saved = p.putBytes("scheduleV2", &schedule, sizeof(schedule)) == sizeof(schedule);
   p.end();
+  return saved;
 }
 
 void loadSettings() {
   Preferences p;
   if (!p.begin("kalsbell", true)) return;
 
-  int savedCount = p.getUChar("count", 0);
-
-  if (savedCount >= 0 &&
-      savedCount <= MAX_EVENTS &&
-      p.getBytesLength("events") == sizeof(events)) {
-
-    p.getBytes("events", events, sizeof(events));
-    eventCount = savedCount;
+  if (p.isKey("scheduleV2")) {
+    if (p.getBytesLength("scheduleV2") == sizeof(schedule)) {
+      p.getBytes("scheduleV2", &schedule, sizeof(schedule));
+    }
+  } else {
+    LegacyEvent previous[MAX_EVENTS]{};
+    const uint8_t count = p.getUChar("count", 0);
+    if (count <= MAX_EVENTS && p.getBytesLength("events") == sizeof(previous) &&
+        p.getBytes("events", previous, sizeof(previous)) == sizeof(previous)) {
+      schedule.count = count;
+      schedule.enabled = p.getBool("enabled", false);
+      for (int i = 0; i < count; i++) {
+        const LegacyEvent& event = previous[i];
+        if (event.durationMs < 100 || event.durationMs > BUZZER_MAX_MS) {
+          schedule = {};
+          break;
+        }
+        schedule.events[i] = {
+          event.day, event.hour, event.minute, event.durationMs,
+          min(event.durationMs, static_cast<uint16_t>(150))
+        };
+      }
+    }
   }
-
-  scheduleEnabled = p.getBool("enabled", false);
   p.end();
 
-  for (int i = 0; i < eventCount; i++) {
-    if (events[i].day > 6 ||
-        events[i].hour > 23 ||
-        events[i].minute > 59 ||
-        events[i].durationMs < 100 ||
-        events[i].durationMs > 30000) {
-      eventCount = 0;
-      scheduleEnabled = false;
-      break;
+  if (schedule.count > MAX_EVENTS) {
+    schedule = {};
+    return;
+  }
+
+  for (int i = 0; i < schedule.count; i++) {
+    const BellEvent& event = schedule.events[i];
+    if (event.day > 6 || event.hour > 23 || event.minute > 59 ||
+        event.buzzerMs > BUZZER_MAX_MS || event.solenoidMs > 5000 ||
+        (event.buzzerMs == 0 && event.solenoidMs == 0)) {
+      schedule = {};
+      return;
     }
   }
 }
 
 void stopSolenoid(void*) {
   digitalWrite(SOLENOID_PIN, LOW);
+  lastSolenoidOffAt.store(millis());
   solenoidActive.store(false);
 }
 
 void startSolenoidPulse(uint32_t durationMs) {
   if (solenoidTimer == nullptr || durationMs == 0) return;
 
-  const uint32_t now = millis();
   if (solenoidActive.load() ||
-      (solenoidHasPulsed && now - lastSolenoidPulseAt < SOLENOID_COOLDOWN_MS)) {
+      (solenoidHasPulsed && millis() - lastSolenoidOffAt.load() < SOLENOID_COOLDOWN_MS)) {
     Serial.println("Solenoid skipped: cooling down.");
     return;
   }
 
-  const uint32_t pulseMs = min(durationMs, SOLENOID_PULSE_MS);
+  const uint32_t pulseMs = min(durationMs, static_cast<uint32_t>(SOLENOID_MAX_MS));
   solenoidActive.store(true);
   digitalWrite(SOLENOID_PIN, HIGH);
 
@@ -151,7 +169,6 @@ void startSolenoidPulse(uint32_t durationMs) {
   }
 
   solenoidHasPulsed = true;
-  lastSolenoidPulseAt = now;
 }
 
 void setMorseOutputs(bool on) {
@@ -169,21 +186,16 @@ void stopBell() {
   setMorseOutputs(false);
 }
 
-void startBell(uint32_t durationMs) {
-  uint32_t now = millis();
+void startBell(uint16_t buzzerMs, uint16_t solenoidMs) {
+  startSolenoidPulse(solenoidMs);
+  if (buzzerMs == 0) return;
 
+  const uint32_t now = millis();
   bellActive = true;
-  bellEnd = now + durationMs;
+  bellEnd = now + buzzerMs;
   morseIndex = 0;
-
   setMorseOutputs(true);
   nextMorseTransition = now + MORSE_DASH_MS;
-  startSolenoidPulse(durationMs);
-
-  Serial.printf(
-    "MAYANK MORSE STARTED: %lu ms\n",
-    (unsigned long)durationMs
-  );
 }
 
 void updateBell() {
@@ -200,12 +212,10 @@ void updateBell() {
   if ((int32_t)(now - nextMorseTransition) < 0) return;
 
   if (morseToneOn) {
-
     setMorseOutputs(false);
     morseIndex++;
 
     if (MORSE_MAYANK[morseIndex] == '\0') {
-
       morseIndex = 0;
       nextMorseTransition = now + MORSE_REPEAT_GAP_MS;
     } else if (MORSE_MAYANK[morseIndex] == ' ') {
@@ -215,7 +225,6 @@ void updateBell() {
       nextMorseTransition = now + MORSE_SYMBOL_GAP_MS;
     }
   } else {
-
     const char symbol = MORSE_MAYANK[morseIndex];
     setMorseOutputs(true);
     nextMorseTransition = now +
@@ -236,16 +245,16 @@ void checkSchedule() {
 
   lastMinuteSeen = currentMinute;
 
-  if (!scheduleEnabled) return;
+  if (!schedule.enabled) return;
 
-  for (int i = 0; i < eventCount; i++) {
-    BellEvent &e = events[i];
+  for (int i = 0; i < schedule.count; i++) {
+    const BellEvent& e = schedule.events[i];
 
     if (e.day == now.dayOfTheWeek() &&
         e.hour == now.hour() &&
         e.minute == now.minute()) {
 
-      startBell(e.durationMs);
+      startBell(e.buzzerMs, e.solenoidMs);
       break;
     }
   }
@@ -285,7 +294,10 @@ void handleSetTime() {
     &hour, &minute, &second
   );
 
-  if (parts < 5 || year < 2020 || year > 2099) {
+  if (parts < 5 || year < 2020 || year > 2099 ||
+      month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+      second < 0 || second > 59) {
     server.send(400, "text/plain", "Invalid date/time");
     return;
   }
@@ -306,416 +318,393 @@ void handleSetTime() {
   lastMinuteSeen = rtc.now().unixtime() / 60;
 
   Serial.println("RTC time updated.");
-  redirectHome();
+  server.send(204);
+}
+
+int readWeekday(const char* field) {
+  const String value = server.arg(field);
+  if (value.length() != 1 || value[0] < '0' || value[0] > '6') return -1;
+  return value[0] - '0';
+}
+
+int findEvent(int day, int hour, int minute) {
+  for (int i = 0; i < schedule.count; i++) {
+    const BellEvent& event = schedule.events[i];
+    if (event.day == day && event.hour == hour && event.minute == minute) return i;
+  }
+  return -1;
+}
+
+bool readClockTime(const char* field, int& hour, int& minute) {
+  const String value = server.arg(field);
+  char extra;
+  return value.length() == 5 &&
+         sscanf(value.c_str(), "%2d:%2d%c", &hour, &minute, &extra) == 2 &&
+         hour >= 0 && hour < 24 && minute >= 0 && minute < 60;
+}
+
+bool readOutputs(int& buzzer, int& solenoid) {
+  buzzer = readDuration("buzzer", BUZZER_MAX_MS);
+  solenoid = readDuration("solenoid", SOLENOID_MAX_MS);
+  if (buzzer < 0 || solenoid < 0 || (buzzer == 0 && solenoid == 0)) {
+    server.send(400, "text/plain", "Enter valid durations for at least one output.");
+    return false;
+  }
+  return true;
+}
+
+void commitSchedule(const Schedule& previous) {
+  if (!saveSettings()) {
+    schedule = previous;
+    server.send(500, "text/plain", "Could not save schedule.");
+    return;
+  }
+  server.send(204);
 }
 
 void handleAdd() {
-  if (eventCount >= MAX_EVENTS) {
-    server.send(400, "text/plain", "Schedule is full");
+  const int day = readWeekday("day");
+  int hour, minute, buzzer, solenoid;
+  if (day < 0 || !readClockTime("at", hour, minute)) {
+    server.send(400, "text/plain", "Choose a valid day and time.");
     return;
   }
+  if (!readOutputs(buzzer, solenoid)) return;
 
-  if (!server.hasArg("day") ||
-      !server.hasArg("at")) {
-    server.send(400, "text/plain", "Missing event fields");
-    return;
-  }
-
-  int day = server.arg("day").toInt();
-
-  int hour = -1;
-  int minute = -1;
-
-  String timeValue = server.arg("at");
-
-  if (sscanf(
-        timeValue.c_str(),
-        "%d:%d",
-        &hour, &minute
-      ) != 2) {
-    server.send(400, "text/plain", "Invalid time");
-    return;
-  }
-
-  uint32_t duration = durationFromRequest();
-
-  if (day < 0 || day > 6 ||
-      hour < 0 || hour > 23 ||
-      minute < 0 || minute > 59 ||
-      duration == 0) {
-    server.send(400, "text/plain", "Invalid event");
-    return;
-  }
-
-  for (int i = 0; i < eventCount; i++) {
-    if (events[i].day == day &&
-        events[i].hour == hour &&
-        events[i].minute == minute) {
-      server.send(
-        400,
-        "text/plain",
-        "An event already exists at this time"
-      );
+  int target = schedule.count;
+  if (server.hasArg("oldDay")) {
+    const int oldDay = readWeekday("oldDay");
+    int oldHour, oldMinute;
+    if (oldDay < 0 || !readClockTime("oldAt", oldHour, oldMinute)) {
+      server.send(400, "text/plain", "Invalid event reference.");
       return;
     }
+    target = findEvent(oldDay, oldHour, oldMinute);
+    if (target < 0) {
+      server.send(404, "text/plain", "That event no longer exists.");
+      return;
+    }
+  } else if (target == MAX_EVENTS) {
+    server.send(400, "text/plain", "Schedule is full.");
+    return;
   }
 
-  events[eventCount] = {
-    (uint8_t)day,
-    (uint8_t)hour,
-    (uint8_t)minute,
-    (uint16_t)duration
+  const int duplicate = findEvent(day, hour, minute);
+  if (duplicate >= 0 && duplicate != target) {
+    server.send(409, "text/plain", "An event already exists at this time.");
+    return;
+  }
+  const Schedule previous = schedule;
+  schedule.events[target] = {
+    static_cast<uint8_t>(day), static_cast<uint8_t>(hour),
+    static_cast<uint8_t>(minute), static_cast<uint16_t>(buzzer),
+    static_cast<uint16_t>(solenoid)
   };
-
-  eventCount++;
-  saveSettings();
-  redirectHome();
+  if (target == schedule.count) schedule.count++;
+  commitSchedule(previous);
 }
 
 void handleDelete() {
-  if (!server.hasArg("id")) {
-    server.send(400, "text/plain", "Missing ID");
+  const int day = readWeekday("day");
+  int hour, minute;
+  if (day < 0 || !readClockTime("at", hour, minute)) {
+    server.send(400, "text/plain", "Invalid event reference.");
     return;
   }
-
-  int id = server.arg("id").toInt();
-
-  if (id < 0 || id >= eventCount) {
-    server.send(400, "text/plain", "Invalid ID");
+  const int index = findEvent(day, hour, minute);
+  if (index < 0) {
+    server.send(404, "text/plain", "That event no longer exists.");
     return;
   }
-
-  for (int i = id; i < eventCount - 1; i++) {
-    events[i] = events[i + 1];
+  const Schedule previous = schedule;
+  for (int i = index + 1; i < schedule.count; i++) {
+    schedule.events[i - 1] = schedule.events[i];
   }
-
-  eventCount--;
-  saveSettings();
-  redirectHome();
+  schedule.events[--schedule.count] = {};
+  commitSchedule(previous);
 }
 
 void handleToggle() {
-  scheduleEnabled = !scheduleEnabled;
-  saveSettings();
-  redirectHome();
+  const Schedule previous = schedule;
+  schedule.enabled = !schedule.enabled;
+  commitSchedule(previous);
 }
 
 void handleTest() {
-  uint32_t duration = durationFromRequest();
-
-  if (duration == 0) {
-    server.send(400, "text/plain", "Invalid duration");
-    return;
-  }
-
-  startBell(duration);
-  redirectHome();
+  int buzzer, solenoid;
+  if (!readOutputs(buzzer, solenoid)) return;
+  startBell(buzzer, solenoid);
+  server.send(204);
 }
 
-void handleHome() {
-  String page = R"HTML(
-<!DOCTYPE html>
+void handleEvents() {
+  String json;
+  json.reserve(1700);
+  json = schedule.enabled ? "{\"enabled\":true" : "{\"enabled\":false";
+  json += ",\"limit\":";
+  json += SOLENOID_MAX_MS;
+  json += ",\"events\":[";
+  for (int i = 0; i < schedule.count; i++) {
+    const BellEvent& e = schedule.events[i];
+    char row[32];
+    snprintf(row, sizeof(row), "%s[%u,%u,%u,%u,%u]", i ? "," : "",
+             e.day, e.hour, e.minute, e.buzzerMs, e.solenoidMs);
+    json += row;
+  }
+  json += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+const char DASHBOARD[] PROGMEM = R"BELL(
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<title>KALS Bell Controller</title>
-
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Automatic Bell System</title>
 <style>
-* { box-sizing: border-box; }
-
-body {
-  font-family: Arial, sans-serif;
-  background: #f3f5f9;
-  color: #172033;
-  margin: 0;
-  padding: 20px;
-}
-
-.container {
-  max-width: 800px;
-  margin: auto;
-}
-
-.card {
-  background: white;
-  border-radius: 14px;
-  padding: 22px;
-  margin-bottom: 18px;
-  box-shadow: 0 2px 12px #00000010;
-}
-
-h1 { font-size: 26px; }
-h2 { font-size: 19px; margin-top: 0; }
-
-.clock {
-  font-size: clamp(23px, 5vw, 36px);
-  font-weight: bold;
-  text-align: center;
-  padding: 20px 0;
-}
-
-input, select, button {
-  padding: 11px;
-  margin: 5px 0;
-  font-size: 15px;
-  border-radius: 7px;
-}
-
-input, select {
-  border: 1px solid #ccd2dc;
-  max-width: 100%;
-}
-
-button {
-  background: #2563eb;
-  color: white;
-  border: none;
-  cursor: pointer;
-}
-
-button.danger { background: #dc2626; }
-button.secondary { background: #475569; }
-
-.row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.event {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 10px;
-  border-top: 1px solid #e5e7eb;
-  padding: 8px 0;
-}
-
-.event form { margin: 0; }
-
-.small {
-  color: #64748b;
-  font-size: 13px;
-}
-
-.status {
-  color: #16a34a;
-  font-weight: bold;
-}
+:root{color-scheme:light;--ink:#1c241f;--paper:#f4f2eb;--line:#a2a59b;--muted:#4e584f}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.45 system-ui,sans-serif}
+header{border-bottom:1px solid var(--line)}.shell{max-width:1080px;margin:auto;padding:24px}
+.top,.bar,.actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+h1,h2{font-family:Georgia,serif;font-weight:400;line-height:1.06;margin:0}h1{font-size:clamp(2rem,5vw,3.6rem)}h2{font-size:1.7rem}
+#clock,td{font-variant-numeric:tabular-nums}summary{cursor:pointer;color:var(--muted);margin-top:4px}
+section{border:1px solid var(--line);padding:20px;margin-bottom:18px}
+.grid{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin-top:14px}
+label{display:grid;gap:4px;font-size:.84rem;color:var(--muted)}input,select,button{font:inherit;color:var(--ink);background:#fcfbf7;border:1px solid var(--line);border-radius:0;padding:8px 10px;min-height:40px}
+input[type=number]{width:8rem}button{cursor:pointer}button.primary{background:var(--ink);border-color:var(--ink);color:white}button:hover{border-color:var(--ink)}button:disabled{opacity:.55;cursor:wait}
+:focus-visible{outline:2px solid #346349;outline-offset:2px}
+.table{overflow:auto;margin-top:14px}table{border-collapse:collapse;width:100%;min-width:540px;text-align:left}
+th,td{padding:9px 12px;border-bottom:1px solid var(--line)}th{font-size:.8rem;font-weight:600;background:#eae9e1}tr:last-child td{border-bottom:0}td button{min-height:0;padding:4px 7px;margin-right:4px}
+#notice{margin:0 0 12px;color:#8c3326}#notice:empty{display:none}#scheduleState{color:var(--muted);font-size:.85rem}
+@media(max-width:640px){.shell{padding:16px}section{padding:14px}}
 </style>
 </head>
-
 <body>
-<div class="container">
-
-<div class="card">
-  <h1>KALS Bell Controller</h1>
-  <p class="status">ESP32 Online - Local Wi-Fi</p>
-  <div class="clock" id="clock">Loading...</div>
-  <p class="small">Time is read from the DS3231 RTC.</p>
-</div>
-
-<div class="card">
-  <h2>Set Clock</h2>
-
-  <button type="button" onclick="syncPC()">
-    Sync with Laptop Time
-  </button>
-
-  <p>Or manually select the date and time:</p>
-
-  <form action="/settime" method="POST">
-    <div class="row">
-      <input type="datetime-local"
-             name="dt"
-             step="1"
-             required>
-      <button type="submit">Set RTC</button>
-    </div>
-  </form>
-</div>
-
-<div class="card">
-  <h2>Test Bell</h2>
-  <p class="small">
-    Play MAYANK in Morse code: -- .- -.-- .- -. -.-
-    The buzzer and LED pulse together. The message repeats until
-    the selected duration ends (a full message takes about 5.9 seconds).
-    Test Bell also pulses the solenoid when its cooldown has elapsed.
-  </p>
-
-  <form action="/test" method="POST">
-    <div class="row">
-      <label>
-        Duration (seconds)
-        <input type="number"
-               name="duration"
-               value="6"
-               min="0.1"
-               max="30"
-               step="0.1"
-               required>
-      </label>
-      <button type="submit">Test Bell</button>
-    </div>
-  </form>
-</div>
-
-<div class="card">
-  <h2>Weekly Schedule</h2>
-
-  <form action="/toggle" method="POST">
-)HTML";
-
-  page += "<p>Automatic scheduling: <b>";
-  page += scheduleEnabled ? "ENABLED" : "PAUSED";
-  page += "</b></p>";
-
-  page += "<button type='submit' class='secondary'>";
-  page += scheduleEnabled ? "Pause Schedule" : "Enable Schedule";
-  page += "</button></form>";
-
-  page += R"HTML(
-  <h3>Add Bell Event</h3>
-  <p class="small">
-    A complete MAYANK takes about 5.9 seconds. Shorter bell
-    durations will stop the message partway through.
-    Scheduled rings also pulse the solenoid when its cooldown has elapsed.
-  </p>
-
-  <form action="/add" method="POST">
-    <div class="row">
-
-      <select name="day" required>
-        <option value="1">Monday</option>
-        <option value="2">Tuesday</option>
-        <option value="3">Wednesday</option>
-        <option value="4">Thursday</option>
-        <option value="5">Friday</option>
-        <option value="6">Saturday</option>
-        <option value="0">Sunday</option>
-      </select>
-
-      <input type="time"
-             name="at"
-             required>
-
-      <label>
-        Duration (seconds)
-        <input type="number"
-               name="duration"
-               min="0.1"
-               max="30"
-               step="0.1"
-               value="6"
-               required>
-      </label>
-
-      <button type="submit">Add Event</button>
-    </div>
-  </form>
-
-  <h3>Saved Events</h3>
-)HTML";
-
-  if (eventCount == 0) {
-    page += "<p class='small'>No events yet.</p>";
-  }
-
-  for (int i = 0; i < eventCount; i++) {
-    BellEvent &e = events[i];
-
-    page += "<div class='event'><span><b>";
-    page += DAY_NAMES[e.day];
-    page += "</b> &nbsp;";
-    page += pad2(e.hour);
-    page += ":";
-    page += pad2(e.minute);
-    page += " &nbsp;(";
-    page += String(e.durationMs / 1000.0f, 1);
-    page += " seconds)</span>";
-
-    page += "<form method='POST' action='/delete'>";
-    page += "<input type='hidden' name='id' value='";
-    page += String(i);
-    page += "'>";
-    page += "<button class='danger' type='submit'>";
-    page += "Delete</button></form></div>";
-  }
-
-  page += R"HTML(
-</div>
-
-<p class="small" style="text-align:center">
-  KALS Automated Bell System - MAYANK Morse Prototype
-</p>
-
-</div>
-
+<header><div class="shell top">
+<h1>Automatic Bell System</h1>
+<div><time id="clock">Connecting</time>
+<details><summary>Set clock</summary>
+<form id="clockForm" class="grid">
+<label>Date and time<input name="dt" type="datetime-local" step="1" required></label>
+<button>Set clock</button><button type="button" id="sync">Use laptop time</button>
+</form>
+</details></div>
+</div></header>
+<main class="shell">
+<p id="notice" role="status"></p>
+<section>
+<h2>Test Bell</h2>
+<form id="testForm" class="grid">
+<label>Buzzer (s)<input name="buzzer" type="number" min="0" max="30" step=".001" value="6" required></label>
+<label>Solenoid (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
+<button class="primary" disabled>Ring</button>
+</form>
+</section>
+<section>
+<h2 id="formTitle">Add event</h2>
+<form id="eventForm" class="grid">
+<label>Day<select name="day"></select></label>
+<label>Time<input name="at" type="time" required></label>
+<label>Buzzer (s)<input name="buzzer" type="number" min="0" max="30" step=".001" value="6" required></label>
+<label>Solenoid (s)<input name="solenoid" type="number" min="0" step=".001" required></label>
+<button class="primary" id="eventSubmit" disabled>Add event</button>
+<button id="cancel" type="button" hidden>Cancel</button>
+</form>
+</section>
+<section>
+<div class="bar"><h2>Events</h2><div class="actions">
+<span id="scheduleState"></span><button id="toggle" disabled>Resume</button>
+<label>Sort by<select id="sort">
+<option value="week">Day then time</option>
+<option value="time">Time of day</option>
+<option value="buzzer">Buzzer duration</option>
+<option value="solenoid">Solenoid duration</option>
+</select></label>
+<button id="direction" type="button" aria-label="Sort descending">Ascending</button>
+</div></div>
+<div class="table"><table>
+<thead><tr><th scope="col">Day</th><th scope="col">Time</th><th scope="col">Buzzer (s)</th><th scope="col">Solenoid (s)</th><th scope="col">Actions</th></tr></thead>
+<tbody id="rows"><tr><td colspan="5">Loading events</td></tr></tbody>
+</table></div>
+</section>
+</main>
 <script>
+const byId = id => document.getElementById(id);
+const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const dayOrder = day => (day + 6) % 7;
+const pad = value => String(value).padStart(2,'0');
+const eventTime = event => pad(event[1]) + ':' + pad(event[2]);
+const el = (tag, text) => {
+  const node = document.createElement(tag);
+  node.textContent = text;
+  return node;
+};
+const testForm = byId('testForm');
+const eventForm = byId('eventForm');
+const clockForm = byId('clockForm');
+const sort = byId('sort');
+let events = [], solenoidLimit = 0, editing = null, descending = false;
+
+[1,2,3,4,5,6,0].forEach(day => {
+  eventForm.elements.day.add(new Option(days[day], day));
+});
+
+async function post(path, values) {
+  const result = await fetch(path, {
+    method:'POST',
+    body:new URLSearchParams(values)
+  });
+  if (!result.ok) throw new Error(await result.text());
+}
+
+async function run(action) {
+  byId('notice').textContent = '';
+  try { await action(); }
+  catch (error) { byId('notice').textContent = error.message; }
+}
+
+async function loadEvents() {
+  const response = await fetch('/events', {cache:'no-store'});
+  if (!response.ok) throw new Error('Could not load events.');
+  const data = await response.json();
+  events = data.events;
+  if (!solenoidLimit) {
+    solenoidLimit = data.limit / 1000;
+    for (const form of [testForm, eventForm]) {
+      form.elements.solenoid.max = solenoidLimit;
+      form.elements.solenoid.defaultValue = Math.min(.15, solenoidLimit);
+      form.querySelector('button').disabled = false;
+    }
+  }
+  byId('scheduleState').textContent = data.enabled ? 'Schedule on' : 'Schedule paused';
+  byId('toggle').textContent = data.enabled ? 'Pause' : 'Resume';
+  byId('toggle').disabled = false;
+  renderEvents();
+}
+
+function renderEvents() {
+  const time = event => event[1] * 60 + event[2];
+  const week = event => dayOrder(event[0]) * 1440 + time(event);
+  const key = {week,time,buzzer:event => event[3],solenoid:event => event[4]}[sort.value];
+  const ordered = [...events].sort((a,b) =>
+    (key(a) - key(b)) * (descending ? -1 : 1) || week(a) - week(b)
+  );
+  const body = byId('rows');
+  body.replaceChildren();
+  if (!ordered.length) {
+    const cell = el('td','No events');
+    cell.colSpan = 5;
+    body.insertRow().append(cell);
+  }
+  for (const event of ordered) {
+    const row = body.insertRow();
+    [days[event[0]],eventTime(event),event[3]/1000,event[4]/1000].forEach(value => {
+      row.append(el('td', value));
+    });
+    const actions = row.insertCell();
+    const edit = el('button','Edit');
+    const remove = el('button','Delete');
+    edit.onclick = () => editEvent(event);
+    remove.onclick = () => run(async () => {
+      await post('/delete', {day:event[0], at:eventTime(event)});
+      if (editing && editing[0] === event[0] && eventTime(editing) === eventTime(event)) resetForm();
+      await loadEvents();
+    });
+    actions.append(edit, remove);
+  }
+}
+
+function editEvent(event) {
+  editing = event;
+  eventForm.elements.day.value = event[0];
+  eventForm.elements.at.value = eventTime(event);
+  eventForm.elements.buzzer.value = event[3] / 1000;
+  eventForm.elements.solenoid.value = event[4] / 1000;
+  byId('formTitle').textContent = 'Edit event';
+  byId('eventSubmit').textContent = 'Save event';
+  byId('cancel').hidden = false;
+  eventForm.elements.at.focus();
+}
+
+function resetForm() {
+  editing = null;
+  eventForm.reset();
+  byId('formTitle').textContent = 'Add event';
+  byId('eventSubmit').textContent = 'Add event';
+  byId('cancel').hidden = true;
+}
+
+function bindForm(form, action) {
+  form.onsubmit = event => {
+    event.preventDefault();
+    const values = new FormData(form);
+    const submit = event.submitter || form.querySelector('button');
+    submit.disabled = true;
+    run(async () => {
+      try { await action(values); }
+      finally { submit.disabled = false; }
+    });
+  };
+}
+
+bindForm(testForm, values => post('/test', values));
+bindForm(eventForm, async values => {
+  if (editing) {
+    values.set('oldDay', editing[0]);
+    values.set('oldAt', eventTime(editing));
+  }
+  await post('/add', values);
+  resetForm();
+  await loadEvents();
+});
+byId('cancel').onclick = resetForm;
+byId('toggle').onclick = () => run(async () => {
+  byId('toggle').disabled = true;
+  try {
+    await post('/toggle', {});
+    await loadEvents();
+  } finally {
+    byId('toggle').disabled = false;
+  }
+});
+sort.onchange = renderEvents;
+byId('direction').onclick = () => {
+  descending = !descending;
+  byId('direction').textContent = descending ? 'Descending' : 'Ascending';
+  byId('direction').setAttribute('aria-label', descending ? 'Sort ascending' : 'Sort descending');
+  renderEvents();
+};
+
 async function refreshClock() {
   try {
-    const r = await fetch("/time", {
-      cache: "no-store"
-    });
-
-    if (!r.ok) throw new Error("RTC unavailable");
-
-    document.getElementById("clock").textContent =
-      await r.text();
-
-  } catch (e) {
-    document.getElementById("clock").textContent =
-      "Connection lost";
+    const response = await fetch('/time', {cache:'no-store'});
+    if (!response.ok) throw new Error();
+    byId('clock').textContent = await response.text();
+  } catch (error) {
+    byId('clock').textContent = 'Clock offline';
+  } finally {
+    setTimeout(refreshClock, 2000);
   }
 }
 
-function syncPC() {
-  const d = new Date();
-  const p = n => String(n).padStart(2, "0");
-
-  const dt =
-    d.getFullYear() + "-" +
-    p(d.getMonth() + 1) + "-" +
-    p(d.getDate()) + "T" +
-    p(d.getHours()) + ":" +
-    p(d.getMinutes()) + ":" +
-    p(d.getSeconds());
-
-  fetch("/settime", {
-    method: "POST",
-    headers: {
-      "Content-Type":
-        "application/x-www-form-urlencoded"
-    },
-    body: new URLSearchParams({dt})
-  })
-  .then(r => {
-    if (!r.ok) throw new Error("Clock update failed");
-    location.reload();
-  })
-  .catch(e => alert(e.message));
-}
-
+bindForm(clockForm, values => post('/settime', values));
+byId('sync').onclick = () => run(async () => {
+  const now = new Date();
+  const date = [now.getFullYear(),pad(now.getMonth()+1),pad(now.getDate())].join('-');
+  const time = [pad(now.getHours()),pad(now.getMinutes()),pad(now.getSeconds())].join(':');
+  await post('/settime', {dt:date+'T'+time});
+});
 refreshClock();
-setInterval(refreshClock, 1000);
+run(loadEvents);
 </script>
-
 </body>
 </html>
-)HTML";
+)BELL";
 
-  server.send(
-    200,
-    "text/html; charset=utf-8",
-    page
-  );
+void handleHome() {
+  server.send_P(200, PSTR("text/html; charset=utf-8"), DASHBOARD);
 }
 
 void setup() {
@@ -767,6 +756,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleHome);
   server.on("/time", HTTP_GET, handleTime);
+  server.on("/events", HTTP_GET, handleEvents);
 
   server.on("/settime", HTTP_POST, handleSetTime);
   server.on("/add", HTTP_POST, handleAdd);
