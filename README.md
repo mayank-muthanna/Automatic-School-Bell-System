@@ -4,7 +4,7 @@
 
 A school bell controller that runs from an ESP32 and a DS3231 clock. A laptop connects directly to the controller to set the time, test the bell, and edit the weekly timetable. Once configured, the controller runs the schedule with the laptop disconnected.
 
-The bench prototype uses the onboard blue LED and an active-low buzzer. Both spell **MAYANK** in Morse code for the selected ring duration. The firmware also pulses a MOSFET-driven solenoid for bench testing. Mounting and validating it against the school's existing momentary switch is a future hardware milestone.
+The bench prototype uses the onboard blue LED and an active-low buzzer. Both spell **MAYANK** in Morse code for the selected buzzer duration. The firmware also pulses a MOSFET-driven solenoid for bench testing. Mounting and validating it against the school's existing momentary switch is a future hardware milestone.
 
 ## Repository layout
 
@@ -37,21 +37,23 @@ Use a buzzer module compatible with a 3.3 V logic signal and power its supply pi
 
 ## Run a first scheduled bell
 
-1. Select **Sync with Laptop Time** or enter the local date and time manually. Check the displayed date and time against the laptop. If the RTC reports power loss on boot, the sketch initially uses its build timestamp.
-2. Select **Test Bell** for six seconds. The blue LED and buzzer should pulse together. A shorter duration can end partway through a letter.
-3. Add an event for today's weekday at least two minutes ahead, then select **Enable Schedule**. The clock processes each minute once and skips the minute in which it starts up or the clock is set.
+1. Select **Set clock → Use laptop time** or enter the local date and time manually. Check the displayed date and time against the laptop. If the RTC reports power loss on boot, the sketch initially uses its build timestamp.
+2. Under **Test Bell**, set **Buzzer (s)** to `6`, set **Solenoid (s)** to `0`, and click **Ring**. The blue LED and buzzer should pulse together. A shorter duration can end partway through a letter.
+3. Add an event for today's weekday at least two minutes ahead, then select **Resume** if the schedule is paused. The clock processes each minute once and skips the minute in which it starts up or the clock is set.
 4. Disconnect the laptop and leave the controller powered. At the chosen minute, check the LED and buzzer. Reconnect and restart the ESP32 to check that the event and schedule setting persist.
 
-With the solenoid driver connected, Test Bell and scheduled rings request a single pulse of up to **150 ms**. Pulse starts are at least **3 seconds** apart. The LED and buzzer still follow the selected ring duration even when the solenoid is cooling down.
+Test Bell and each scheduled event have separate **Buzzer (s)** and **Solenoid (s)** settings. Set either to `0` to skip that output. The buzzer and LED follow the buzzer duration, up to 30 seconds. The solenoid emits one pulse, followed by at least three seconds off before another pulse can start.
 
-The timetable stores up to **60 weekly events** in ESP32 flash. Each event has a weekday, a local time to the minute, and a duration from **0.1 to 30 seconds**. A weekday and time can appear only once. A fresh configuration starts with scheduling paused.
+The solenoid limit defaults to **0.15 s**. For hardware with a verified duty-cycle rating, set `BELL_SOLENOID_MAX_MS` in the local `bell_secrets.h` and reflash. The firmware supports limits up to `5000` ms and clamps the output to the current limit even for events saved on a build with a higher limit.
+
+The timetable stores up to **60 weekly events** in ESP32 flash. Existing events retain their buzzer duration and inherit their former solenoid pulse length. Use **Edit** to change either setting. Sort by weekday, time of day, buzzer duration, or solenoid duration in either direction. A weekday and time can appear only once. A fresh configuration starts with scheduling paused.
 
 ## Troubleshooting
 
 | Observation | What to check |
 | --- | --- |
 | Serial Monitor prints `RTC NOT FOUND!` and Wi-Fi never appears | Check the RTC power, common ground, SDA and SCL. Run the standalone RTC sketch first. |
-| Test Bell works but an event is silent | Check the displayed date and time, event weekday, and **ENABLED** status. Try a fresh event two minutes ahead. |
+| Test Bell works but an event is silent | Check the displayed date and time, event weekday, and **Schedule on** status. Try a fresh event two minutes ahead. |
 | Clock is wrong after losing USB power | Resync it from the dashboard, then repeat the RTC backup-cell test. |
 | Buzzer sounds at idle or only the LED works | Check the module's I/O pin, active-low polarity, supply rating and common ground. |
 

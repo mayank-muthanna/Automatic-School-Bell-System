@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added independent buzzer and solenoid durations for Test Bell and weekly events. Existing timetables carry forward automatically.
+- Rebuilt the local dashboard with an editable events table and four sortable columns.
+
 - Added a GPIO 18 output for a MOSFET-driven solenoid. Scheduled rings and Test Bell can each request one pulse of up to 150 ms, with a three-second cooldown between pulse starts.
 
 ## [0.1.0] — 2026-11-22
